@@ -14,7 +14,8 @@ import (
 	"os"
 )
 
-const DedupSrvHome string = "/tmp/dedupSrvHome"
+const DedupSrvHome string = "/tmp/dedupSrvHome/"
+const DedupSrvCache string = "/tmp/dedupdiskcache/"
 
 // handle GET request by sending the content of the request file to client
 func ProcessGetRequest(w *http.ResponseWriter, r *http.Request) {
@@ -50,17 +51,21 @@ func ProcessPutRequest(w *http.ResponseWriter, r *http.Request) {
 	log.Println("Received PUT request", r.URL)
 
 	// create a temp file
-	file, err := ioutil.TempFile("/tmp", "putdata.*.txt")
-	if err == nil {
-		log.Println("created a temp file", file.Name())
-	} else {
+	tempFile, err := ioutil.TempFile("/tmp", "putdata.*.txt")
+	if err != nil {
 		log.Fatalln("could not create a temp file", err)
 		http.Error(*w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
+	log.Println("created a temp file ", tempFile.Name())
 
-	// create a map to store words
-	wordMap := make(map[string]bool)
+	// initialize disk cache
+	mkerr := os.MkdirAll(DedupSrvCache+tempFile.Name(), 0700)
+	if mkerr != nil {
+		log.Fatalln("creating dedup server disk cache failed", err)
+		http.Error(*w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
 
 	// read words from the payload
 	var lines int = 0
@@ -75,51 +80,70 @@ func ProcessPutRequest(w *http.ResponseWriter, r *http.Request) {
 		//log.Println(word)
 
 		// skip word if it is a duplicate
-		if wordMap[word] == true {
+		var wordpath string = DedupSrvCache + tempFile.Name() + "/" + word
+		ofd, oerr := os.Open(wordpath)
+		if oerr == nil {
 			duplicates++
 			//log.Println("skipping word ", word)
+			ofd.Close()
 			continue
 		}
 
-		// mark word as encountered
-		wordMap[word] = true
+		// mark word as encountered by creating a file in diskcache
+		cfd, cerr := os.Create(wordpath)
+		if cerr != nil {
+			log.Fatalln("error creating a word marker file in cache", cfd, cerr)
+			http.Error(*w, http.StatusText(http.StatusInsufficientStorage), http.StatusInsufficientStorage)
+			defer os.Remove(tempFile.Name())
+			defer os.RemoveAll(DedupSrvCache + tempFile.Name())
+			return
+		}
+		cfd.Close()
 
 		// output word to the file
-		n, err := file.WriteString(word + "\n")
+		n, err := tempFile.WriteString(word + "\n")
 		if err != nil {
 			log.Fatalln("error processing PUT request", n, err)
 			http.Error(*w, http.StatusText(http.StatusInsufficientStorage), http.StatusInsufficientStorage)
-			defer os.Remove(file.Name())
+			defer os.Remove(tempFile.Name())
+			defer os.RemoveAll(DedupSrvCache + tempFile.Name())
 			return
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		log.Fatalln("error processing PUT request", err)
 		http.Error(*w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		defer os.Remove(file.Name())
+		defer os.Remove(tempFile.Name())
+		defer os.RemoveAll(DedupSrvCache + tempFile.Name())
 		return
 	}
 
 	// move the temp file to requested path
 	targetlocation := DedupSrvHome + r.URL.Path
-	mverr := os.Rename(file.Name(), targetlocation)
+	mverr := os.Rename(tempFile.Name(), targetlocation)
 	if mverr != nil {
 		log.Fatalln("error moving temp file to target location", targetlocation)
 		http.Error(*w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		defer os.Remove(file.Name())
+		defer os.Remove(tempFile.Name())
+		defer os.RemoveAll(DedupSrvCache + tempFile.Name())
 		return
 	}
+
+	// purge disk cache
+	defer os.RemoveAll(DedupSrvCache + tempFile.Name())
+
 	log.Println("successfully processed PUT request to ", targetlocation,
 		" lines ", lines, "duplicates ", duplicates)
 }
 
 func HelloServer(w http.ResponseWriter, r *http.Request) {
 
-	if r.Method == http.MethodGet {
+	switch r.Method {
+	case http.MethodGet:
 		ProcessGetRequest(&w, r)
-	} else if r.Method == http.MethodPut {
+	case http.MethodPut:
 		ProcessPutRequest(&w, r)
-	} else {
+	default:
 		log.Fatalln("Unsupported request method")
 		http.Error(w, http.StatusText(http.StatusNotImplemented), http.StatusNotImplemented)
 	}
@@ -127,11 +151,13 @@ func HelloServer(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 
+	// create deduplication server home dir
 	err := os.MkdirAll(DedupSrvHome, 0700)
 	if err != nil {
 		log.Fatalln("creating dedup server home failed", err)
 		return
 	}
+
 	http.HandleFunc("/", HelloServer)
 	http.ListenAndServe(":8080", nil)
 }
